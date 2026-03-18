@@ -160,6 +160,24 @@ We welcome contributions from everyone in the community! To get started, please 
 
 
 ```bash
+source /opt/ros/humble/setup.bash
+
+conda activate lerobot-ros2
 ./run_recorder.sh
+
+
+lerobot-dataset-viz \
+    --repo-id isaacsim/robot_recording \
+    --root /home/amit/.cache/huggingface/lerobot/isaacsim/robot_recording_20260314_190857 \
+    --episode-index 0
+
+# 开始录制
+ros2 topic pub /lerobot_command std_msgs/msg/String "data: 'record_start'" --once
+
+# 停止录制
+ros2 topic pub /lerobot_command std_msgs/msg/String "data: 'record_stop'" --once
+
+rm -rf ~/.local/share/rerun
+rm -rf ~/.config/rerun
 
 ```
