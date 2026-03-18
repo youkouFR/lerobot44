@@ -195,32 +195,56 @@ class IsaacSimRecorder(Node):
     def head_callback(self, msg: Image):
         """接收头部相机图像"""
         try:
+            # 检查图像数据是否为空
+            if not msg.data:
+                return
             cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+            # 检查转换后的图像是否为空
+            if cv_image.size == 0:
+                return
             timestamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
             with self.data_lock:
                 self.head_buffer.append((timestamp, cv_image))
         except Exception as e:
-            self.get_logger().error(f"头部相机图像转换失败: {e}")
+            # 只在录制时记录错误，避免启动时的错误刷屏
+            if self.recording:
+                self.get_logger().error(f"头部相机图像转换失败: {e}")
 
     def left_callback(self, msg: Image):
         """接收左手腕相机图像"""
         try:
+            # 检查图像数据是否为空
+            if not msg.data:
+                return
             cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+            # 检查转换后的图像是否为空
+            if cv_image.size == 0:
+                return
             timestamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
             with self.data_lock:
                 self.left_buffer.append((timestamp, cv_image))
         except Exception as e:
-            self.get_logger().error(f"左手相机图像转换失败: {e}")
+            # 只在录制时记录错误，避免启动时的错误刷屏
+            if self.recording:
+                self.get_logger().error(f"左手相机图像转换失败: {e}")
 
     def right_callback(self, msg: Image):
         """接收右手腕相机图像"""
         try:
+            # 检查图像数据是否为空
+            if not msg.data:
+                return
             cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+            # 检查转换后的图像是否为空
+            if cv_image.size == 0:
+                return
             timestamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
             with self.data_lock:
                 self.right_buffer.append((timestamp, cv_image))
         except Exception as e:
-            self.get_logger().error(f"右手相机图像转换失败: {e}")
+            # 只在录制时记录错误，避免启动时的错误刷屏
+            if self.recording:
+                self.get_logger().error(f"右手相机图像转换失败: {e}")
 
     def joint_states_callback(self, msg: JointState):
         """接收关节状态"""
