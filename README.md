@@ -180,4 +180,6 @@ ros2 topic pub /lerobot_command std_msgs/msg/String "data: 'record_stop'" --once
 rm -rf ~/.local/share/rerun
 rm -rf ~/.config/rerun
 
+# 播放录制
+python ros2_isaacsim_player.py --dataset-path /home/amit/Documents/dataset/task2_V3.0/robot_recording_20260320_163643/ --episode 0 --fps 30
 ```

@@ -423,6 +423,11 @@ class IsaacSimRecorder(Node):
             if left_image is None or right_image is None or joint_states is None or joint_command is None or hand_ee is None or arm_ee is None:
                 self.get_logger().warn(f"数据对齐失败，跳过此帧 (head_timestamp: {head_timestamp:.3f}s)")
                 return
+            
+            # 检查图像是否为空
+            if head_image.size == 0 or left_image.size == 0 or right_image.size == 0:
+                self.get_logger().warn(f"图像数据为空，跳过此帧 (head_timestamp: {head_timestamp:.3f}s)")
+                return
 
             # 调试信息：检查图像数据
             if self.episode_frame_count == 0:
