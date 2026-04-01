@@ -182,4 +182,6 @@ rm -rf ~/.config/rerun
 
 # 播放录制
 python ros2_isaacsim_player.py --dataset-path /home/amit/Documents/dataset/task2_V3.0/robot_recording_20260320_163643/ --episode 0 --fps 30
+
+python ros2_isaacsim_player.py --dataset-path /home/amit/Documents/dataset/task4_V3.0/robot_recording_20260322_134001/ --episode 0 --fps 30
 ```
