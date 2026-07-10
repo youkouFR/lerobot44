@@ -118,22 +118,41 @@ class IsaacSimRecorder(Node):
         self.current_task = current_task  # 当前选择的任务
         self.bridge = CvBridge()
 
-        # 带时间戳的数据缓冲区（用于时间戳对齐）
-        self.head_buffer = deque(maxlen=10)
-        self.left_buffer = deque(maxlen=10)
-        self.right_buffer = deque(maxlen=10)
-        self.joint_states_buffer = deque(maxlen=10)
-        self.joint_command_buffer = deque(maxlen=10)
-        self.hand_ee_buffer = deque(maxlen=10)  # 当前末端执行器位姿（observation）
-        self.arm_ee_buffer = deque(maxlen=10)   # 目标末端执行器位姿（action）
+        # 带时间戳的数据缓冲区
+        self.head_buffer = deque(maxlen=30)
+        self.left_buffer = deque(maxlen=30)
+        self.right_buffer = deque(maxlen=30)
+        self.joint_states_buffer = deque(maxlen=30)
+        self.joint_command_buffer = deque(maxlen=30)
+        self.hand_ee_buffer = deque(maxlen=30)  # 当前末端执行器位姿（observation）
+        self.arm_ee_buffer = deque(maxlen=30)   # 目标末端执行器位姿（action）
 
         # 数据锁
         self.data_lock = threading.Lock()
         self.recording = False
         self.episode_frame_count = 0
 
-        # 时间戳对齐的最大延迟（秒）
-        self.max_timestamp_delay = 0.05
+        # 记录每个 buffer 上一次录制的数据时间戳，用于去重
+        # key: buffer 名称, value: 上次录制的时间戳
+        self._last_recorded_ts = {
+            "head": -1.0,
+            "left": -1.0,
+            "right": -1.0,
+            "joint_states": -1.0,
+            "joint_command": -1.0,
+            "hand_ee": -1.0,
+            "arm_ee": -1.0,
+        }
+
+        # 必需的 buffer（必须全部有数据才能录制）
+        self._required_buffers = {"head", "left", "right", "joint_states", "joint_command"}
+        # 可选的 buffer（有数据就用，没有就填零）
+        self._optional_buffers = {"hand_ee", "arm_ee"}
+        # 可选数据的维度（首次收到后记录，用于缺失时填零）
+        self._optional_data_dim = {
+            "hand_ee": 12,   # left(6) + right(6)
+            "arm_ee": 12,    # left(6) + right(6)
+        }
 
         # 创建订阅者
         self.head_sub = self.create_subscription(
@@ -378,55 +397,117 @@ class IsaacSimRecorder(Node):
 
         return positions
 
-    def _find_closest_data(self, buffer, target_time):
-        """在缓冲区中找到时间戳最接近目标时间的数据"""
-        if not buffer:
-            return None
+    def _get_empty_buffers(self, required_only=True):
+        """返回当前为空的 buffer 名称列表
 
-        closest_data = None
-        min_diff = float('inf')
+        Args:
+            required_only: True 只检查必需的 buffer，False 检查全部
+        """
+        empty = []
+        buffers_to_check = self._required_buffers if required_only else (
+            self._required_buffers | self._optional_buffers
+        )
+        if "head" in buffers_to_check and not self.head_buffer:
+            empty.append("head")
+        if "left" in buffers_to_check and not self.left_buffer:
+            empty.append("left")
+        if "right" in buffers_to_check and not self.right_buffer:
+            empty.append("right")
+        if "joint_states" in buffers_to_check and not self.joint_states_buffer:
+            empty.append("joint_states")
+        if "joint_command" in buffers_to_check and not self.joint_command_buffer:
+            empty.append("joint_command")
+        if "hand_ee" in buffers_to_check and not self.hand_ee_buffer:
+            empty.append("hand_ee")
+        if "arm_ee" in buffers_to_check and not self.arm_ee_buffer:
+            empty.append("arm_ee")
+        return empty
 
-        for timestamp, data in buffer:
-            diff = abs(timestamp - target_time)
-            if diff < min_diff:
-                min_diff = diff
-                closest_data = data
+    def _get_optional_data(self, buffer, dim):
+        """从可选 buffer 获取数据，buffer 为空时返回零向量"""
+        if buffer:
+            return buffer[-1][1]  # (timestamp, data) -> data
+        else:
+            return np.zeros(dim, dtype=np.float32)
 
-        # 如果时间差超过最大延迟，认为数据无效
-        if min_diff > self.max_timestamp_delay:
-            return None
-
-        return closest_data
+    def _all_buffers_ready(self):
+        """检查所有必需的 buffer 是否都有数据"""
+        return len(self._get_empty_buffers(required_only=True)) == 0
 
     def record_frame(self):
-        """录制一帧数据（基于时间戳对齐）"""
+        """录制一帧数据（使用各 buffer 最新数据，不做时间戳对齐）
+
+        策略：
+        - 必需的 topic (head/left/right/joint_states/joint_command): 全部就绪才录制
+        - 可选的 topic (hand_ee/arm_ee): 有数据就用，没有就填零
+        - 至少一个 topic 产生新数据才录制（去重）
+        """
         if not self.recording:
             return
 
         with self.data_lock:
-            # 以头部相机的时间戳为基准
-            if not self.head_buffer:
+            # 检查必需的 buffer 是否就绪
+            empty_required = self._get_empty_buffers(required_only=True)
+            if empty_required:
+                now = self.get_clock().now().nanoseconds / 1e9
+                if not hasattr(self, '_last_empty_log_time'):
+                    self._last_empty_log_time = 0.0
+                if now - self._last_empty_log_time > 1.0:
+                    self.get_logger().warn(
+                        f"等待必需 topic 数据... 缺失: {', '.join(empty_required)}"
+                    )
+                    self._last_empty_log_time = now
                 return
 
-            # 获取最新的头部相机数据作为基准
-            head_timestamp, head_image = self.head_buffer[-1]
+            # 从必需 buffer 取最新数据
+            head_ts, head_image = self.head_buffer[-1]
+            left_ts, left_image = self.left_buffer[-1]
+            right_ts, right_image = self.right_buffer[-1]
+            js_ts, joint_states = self.joint_states_buffer[-1]
+            jc_ts, joint_command = self.joint_command_buffer[-1]
 
-            # 根据头部相机的时间戳，找到其他 topic 中最接近的数据
-            left_image = self._find_closest_data(self.left_buffer, head_timestamp)
-            right_image = self._find_closest_data(self.right_buffer, head_timestamp)
-            joint_states = self._find_closest_data(self.joint_states_buffer, head_timestamp)
-            joint_command = self._find_closest_data(self.joint_command_buffer, head_timestamp)
-            hand_ee = self._find_closest_data(self.hand_ee_buffer, head_timestamp)
-            arm_ee = self._find_closest_data(self.arm_ee_buffer, head_timestamp)
+            # 从可选 buffer 取数据（缺失时填零）
+            hand_ee = self._get_optional_data(self.hand_ee_buffer, self._optional_data_dim["hand_ee"])
+            arm_ee = self._get_optional_data(self.arm_ee_buffer, self._optional_data_dim["arm_ee"])
 
-            # 检查所有数据是否都找到
-            if left_image is None or right_image is None or joint_states is None or joint_command is None or hand_ee is None or arm_ee is None:
-                self.get_logger().warn(f"数据对齐失败，跳过此帧 (head_timestamp: {head_timestamp:.3f}s)")
+            # 检查可选 buffer 是否首次变为可用（或仍缺失）
+            missing_optional = [name for name in self._optional_buffers
+                               if not getattr(self, f"{name}_buffer")]
+            if missing_optional:
+                now = self.get_clock().now().nanoseconds / 1e9
+                if not hasattr(self, '_last_optional_log_time'):
+                    self._last_optional_log_time = 0.0
+                if now - self._last_optional_log_time > 5.0:
+                    self.get_logger().warn(
+                        f"可选 topic 仍无数据，将用零填充: {', '.join(missing_optional)}"
+                    )
+                    self._last_optional_log_time = now
+
+            # 检查是否至少有一个 topic 产生了新数据（防止重复录制同一帧）
+            current_ts = {
+                "head": head_ts, "left": left_ts, "right": right_ts,
+                "joint_states": js_ts, "joint_command": jc_ts,
+            }
+            # 可选 topic 的时间戳也参与去重（如果有数据的话）
+            if self.hand_ee_buffer:
+                current_ts["hand_ee"] = self.hand_ee_buffer[-1][0]
+            if self.arm_ee_buffer:
+                current_ts["arm_ee"] = self.arm_ee_buffer[-1][0]
+
+            has_new_data = any(
+                current_ts.get(key, -1.0) > self._last_recorded_ts.get(key, -1.0)
+                for key in current_ts
+            )
+            if not has_new_data:
                 return
-            
+
+            # 更新已录制的时间戳
+            for key in current_ts:
+                self._last_recorded_ts[key] = current_ts[key]
+
             # 检查图像是否为空
             if head_image.size == 0 or left_image.size == 0 or right_image.size == 0:
-                self.get_logger().warn(f"图像数据为空，跳过此帧 (head_timestamp: {head_timestamp:.3f}s)")
+                self.get_logger().warn(f"图像数据为空，跳过此帧")
                 return
 
             # 调试信息：检查图像数据
@@ -438,8 +519,7 @@ class IsaacSimRecorder(Node):
                 self.get_logger().info(f"关节命令形状: {joint_command.shape}, 数据类型: {joint_command.dtype}")
                 self.get_logger().info(f"当前末端执行器形状: {hand_ee.shape}, 数据类型: {hand_ee.dtype}")
                 self.get_logger().info(f"目标末端执行器形状: {arm_ee.shape}, 数据类型: {arm_ee.dtype}")
-                self.get_logger().info(f"基准时间戳: {head_timestamp:.3f}s")
-                
+
                 # 保存第一帧图像用于检查
                 import cv2
                 import os
@@ -452,13 +532,13 @@ class IsaacSimRecorder(Node):
 
             # 构建帧数据 (注意：OpenCV 是 BGR 格式，需要转换为 RGB)
             import cv2
-            
+
             # 将末端执行器数据添加到关节状态中
             combined_state = np.concatenate([joint_states, hand_ee])
-            
+
             # 将目标末端执行器数据添加到关节命令中
             combined_action = np.concatenate([joint_command, arm_ee])
-            
+
             frame = {
                 "observation.images.head": cv2.cvtColor(head_image, cv2.COLOR_BGR2RGB),
                 "observation.images.left": cv2.cvtColor(left_image, cv2.COLOR_BGR2RGB),
@@ -476,7 +556,7 @@ class IsaacSimRecorder(Node):
 
             # 每 30 帧打印一次日志
             if self.episode_frame_count % 30 == 0:
-                self.get_logger().info(f"已录制 {self.episode_frame_count} 帧 (时间戳: {head_timestamp:.3f}s)")
+                self.get_logger().info(f"已录制 {self.episode_frame_count} 帧")
 
         except Exception as e:
             self.get_logger().error(f"添加帧失败: {e}")
@@ -486,6 +566,25 @@ class IsaacSimRecorder(Node):
         if not self.recording:
             self.recording = True
             self.episode_frame_count = 0
+            # 重置时间戳追踪，确保新 episode 从第一帧开始录制
+            for key in self._last_recorded_ts:
+                self._last_recorded_ts[key] = -1.0
+            self._last_empty_log_time = 0.0
+
+            # 立即报告各 topic 数据就绪状态
+            empty_required = self._get_empty_buffers(required_only=True)
+            empty_optional = [name for name in self._optional_buffers
+                            if not getattr(self, f"{name}_buffer")]
+            if empty_required:
+                self.get_logger().warn(
+                    f"必需 topic 尚无数据，录制将等待: {', '.join(empty_required)}"
+                )
+            else:
+                self.get_logger().info("所有必需 topic 数据就绪，开始录制")
+            if empty_optional:
+                self.get_logger().warn(
+                    f"可选 topic 尚无数据，将用零填充: {', '.join(empty_optional)}"
+                )
             self.get_logger().info("=" * 60)
             self.get_logger().info("开始录制!")
             self.get_logger().info("=" * 60)
