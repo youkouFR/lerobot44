@@ -179,3 +179,4 @@ outputs/
 *.part
 log.txt
 debug_images/
+isaacsim/

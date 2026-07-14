@@ -31,11 +31,13 @@ from std_msgs.msg import String
 from cv_bridge import CvBridge
 import numpy as np
 import cv2
+import shutil
 from pathlib import Path
 from datetime import datetime
 import threading
 import signal
 import sys
+import select
 from collections import deque
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -45,8 +47,7 @@ from lerobot.utils.constants import ACTION, OBS_STR
 
 # ==================== 配置参数 ====================
 # 数据集配置
-DATASET_REPO_ID = "isaacsim/robot_recording"  # 数据集名称
-DATASET_ROOT = "./isaacsim_dataset"  # 本地保存路径
+DATASET_BASE_ROOT = "./isaacsim"  # 数据集本地保存根路径
 FPS = 30  # 录制帧率
 
 # 预定义任务列表
@@ -111,12 +112,17 @@ LEROBOT_COMMAND_TOPIC = "/lerobot_command"  # 录制控制命令
 class IsaacSimRecorder(Node):
     """IsaacSim 数据录制节点"""
 
-    def __init__(self, dataset: LeRobotDataset, current_task: dict):
+    def __init__(self, current_task: dict = None, dataset: LeRobotDataset = None):
         super().__init__("isaacsim_recorder")
 
         self.dataset = dataset
-        self.current_task = current_task  # 当前选择的任务
+        self.current_task = current_task or {"task": "isaacsim_vla"}
         self.bridge = CvBridge()
+
+        # 数据集管理（实例级，供 lerobot_command 和 main() 键盘控制公用）
+        self.current_dataset = dataset  # 当前活动的 LeRobotDataset
+        self.current_dataset_root = None  # 当前数据集根路径
+        self.should_exit = False  # record_exit 命令标志
 
         # 带时间戳的数据缓冲区
         self.head_buffer = deque(maxlen=30)
@@ -196,20 +202,77 @@ class IsaacSimRecorder(Node):
         self.get_logger().info(f"  - 目标末端执行器: {ARM_EE_TOPIC}")
         self.get_logger().info(f"  - 录制控制命令: {LEROBOT_COMMAND_TOPIC}")
         self.get_logger().info("=" * 60)
-        self.get_logger().info("按 's' 开始录制, 'q' 停止录制并保存")
-        self.get_logger().info("或通过 /lerobot_command 发送 'record_start'/'record_stop' 控制")
+        self.get_logger().info("按 's-<name>' 创建新数据集并开始录制, 'q' 停止录制并保存")
+        self.get_logger().info("或通过 /lerobot_command 发送 's-<name>'/'record_stop' 控制")
+
+    def set_dataset(self, dataset: LeRobotDataset):
+        """设置/切换当前数据集"""
+        self.dataset = dataset
 
     def lerobot_command_callback(self, msg: String):
-        """接收录制控制命令"""
+        """接收录制控制命令
+
+        支持的命令:
+          record_start   - 开始录制
+          record_stop    - 停止录制并 finalize 当前数据集
+          record_discard - 停止录制并删除当前数据集（用于失败放弃）
+          s-<name>       - 创建 isaacsim/<name>/ 数据集并开始录制 (如 s-step10, s-step12)
+          record_exit    - 停止录制并退出程序
+        """
         command = msg.data.strip().lower()
         self.get_logger().info(f"收到录制命令: {command}")
-        
+
         if command == "record_start":
             self.start_recording()
         elif command == "record_stop":
-            self.stop_recording()
+            ds = self.stop_recording()
+            if ds is not None:
+                self.get_logger().info("完成数据集...")
+                ds.finalize()
+                self.get_logger().info(f"数据集已保存到: {self.current_dataset_root}")
+                self.current_dataset = None
+                self.current_dataset_root = None
+        elif command == "record_discard":
+            # 停止录制并将失败数据集移到 fail 目录（保留用于问题排查）
+            ds = self.stop_recording()
+            if ds is not None and self.current_dataset_root is not None:
+                discard_path = Path(self.current_dataset_root)
+                dataset_name = discard_path.name  # e.g. robot_recording_20260711_203030
+                fail_dir = Path(DATASET_BASE_ROOT) / "fail"
+                fail_dir.mkdir(parents=True, exist_ok=True)
+                target_path = fail_dir / dataset_name
+                self.get_logger().info(f"步骤失败，数据集移至: {target_path}")
+                try:
+                    shutil.move(str(discard_path), str(target_path))
+                    self.get_logger().info(f"数据集已移至: {target_path}")
+                except Exception as e:
+                    self.get_logger().error(f"移动数据集失败: {e}")
+                self.current_dataset = None
+                self.current_dataset_root = None
+        elif command.startswith("s-"):
+            sub_dir = command[2:]  # "s-step10" → "step10"
+            # 如果正在录制，先停止并完成上一个数据集
+            if self.recording:
+                old_ds = self.stop_recording()
+                if old_ds is not None:
+                    self.get_logger().info("完成上一个数据集...")
+                    old_ds.finalize()
+                    self.get_logger().info(f"上一个数据集已保存到: {self.current_dataset_root}")
+            # 创建新数据集并开始录制
+            self.current_dataset, self.current_dataset_root = _create_new_dataset(sub_dir)
+            self.set_dataset(self.current_dataset)
+            self.start_recording()
+        elif command == "record_exit":
+            self.get_logger().info("收到退出命令，正在关闭...")
+            if self.recording:
+                ds = self.stop_recording()
+                if ds is not None:
+                    self.get_logger().info("完成数据集...")
+                    ds.finalize()
+                    self.get_logger().info(f"数据集已保存到: {self.current_dataset_root}")
+            self.should_exit = True
         else:
-            self.get_logger().warn(f"未知命令: {command}，支持的命令: record_start, record_stop")
+            self.get_logger().warn(f"未知命令: {command}，支持: record_start, record_stop, record_discard, s-<name>, record_exit")
 
     def head_callback(self, msg: Image):
         """接收头部相机图像"""
@@ -445,6 +508,9 @@ class IsaacSimRecorder(Node):
         if not self.recording:
             return
 
+        if self.dataset is None:
+            return
+
         with self.data_lock:
             # 检查必需的 buffer 是否就绪
             empty_required = self._get_empty_buffers(required_only=True)
@@ -590,23 +656,27 @@ class IsaacSimRecorder(Node):
             self.get_logger().info("=" * 60)
 
     def stop_recording(self):
-        """停止录制并保存"""
+        """停止录制并保存，返回当前 dataset（用于后续 finalize）"""
         if self.recording:
             self.recording = False
             self.get_logger().info("=" * 60)
             self.get_logger().info(f"停止录制，共录制 {self.episode_frame_count} 帧")
             self.get_logger().info("保存 episode...")
 
+            dataset_to_finalize = self.dataset
             try:
-                self.dataset.save_episode()
-                # 强制 flush metadata buffer，确保 self.meta.latest_episode 被更新
-                # 这样下一个 episode 的视频不会被覆盖
-                self.dataset.meta._flush_metadata_buffer()
-                self.get_logger().info("Episode 保存成功!")
+                if self.dataset is not None:
+                    self.dataset.save_episode()
+                    # 强制 flush metadata buffer，确保 self.meta.latest_episode 被更新
+                    # 这样下一个 episode 的视频不会被覆盖
+                    self.dataset.meta._flush_metadata_buffer()
+                    self.get_logger().info("Episode 保存成功!")
             except Exception as e:
                 self.get_logger().error(f"保存 episode 失败: {e}")
 
             self.episode_frame_count = 0
+            return dataset_to_finalize
+        return None
 
 
 def create_dataset_features():
@@ -686,117 +756,139 @@ def select_task():
             print("请输入有效的数字")
 
 
+def _create_new_dataset(sub_dir: str) -> tuple:
+    """创建新的 LeRobot 数据集
+
+    Args:
+        sub_dir: 子目录名 (如 "1", "2", "3")
+
+    Returns:
+        (dataset, dataset_root_path) 元组
+    """
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    dataset_dir_name = f"robot_recording_{timestamp}"
+    repo_id = f"isaacsim/{sub_dir}/{dataset_dir_name}"
+    root = str(Path(DATASET_BASE_ROOT) / sub_dir / dataset_dir_name)
+
+    print(f"\n创建新数据集:")
+    print(f"  路径: {root}")
+    print(f"  ID: {repo_id}")
+
+    features = create_dataset_features()
+    dataset = LeRobotDataset.create(
+        repo_id=repo_id,
+        root=root,
+        fps=FPS,
+        features=features,
+        robot_type="isaacsim_dual_arm",
+        use_videos=True,
+        image_writer_threads=4,
+    )
+    dataset.vcodec = "h264"
+    return dataset, root
+
+
 def main():
     """主函数"""
-    # 先让用户选择任务
-    current_task = select_task()
-
-    # 创建数据集
-    features = create_dataset_features()
-
     print("\n" + "=" * 60)
-    print("创建 LeRobot 数据集...")
-    print(f"数据集路径: {DATASET_ROOT}")
-    print(f"数据集 ID: {DATASET_REPO_ID}")
+    print("IsaacSim 数据录制器")
+    print(f"数据集根路径: {DATASET_BASE_ROOT}")
     print(f"帧率: {FPS} FPS")
     print("=" * 60)
 
-    # 如果数据集已存在则加载，否则创建新的
-    dataset_root = Path(DATASET_ROOT)
-    if dataset_root.exists():
-        print("检测到已有数据集，将追加新数据...")
-        dataset = LeRobotDataset(
-            repo_id=DATASET_REPO_ID,
-            root=DATASET_ROOT,
-        )
-    else:
-        print("创建新数据集...")
-        print("使用 H.264 编码器（兼容性更好）")
-        try:
-            dataset = LeRobotDataset.create(
-                repo_id=DATASET_REPO_ID,
-                fps=FPS,
-                features=features,
-                robot_type="isaacsim_dual_arm",
-                use_videos=True,  # 使用视频格式存储图像
-                image_writer_threads=4,
-            )
-            # 设置视频编码器为 H.264，兼容性更好
-            dataset.vcodec = "h264"
-        except FileExistsError:
-            # 如果默认路径已存在，使用自定义路径
-            custom_repo_id = f"isaacsim/robot_recording_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            print(f"默认路径已存在，使用自定义路径: {custom_repo_id}")
-            dataset = LeRobotDataset.create(
-                repo_id=custom_repo_id,
-                fps=FPS,
-                features=features,
-                robot_type="isaacsim_dual_arm",
-                use_videos=True,
-                image_writer_threads=4,
-            )
-            # 设置视频编码器为 H.264，兼容性更好
-            dataset.vcodec = "h264"
-
-    # 初始化 ROS2
+    # 初始化 ROS2（不再需要手动选任务，通过 /lerobot_command 控制录制）
     rclpy.init()
-    recorder = IsaacSimRecorder(dataset, current_task)
+    recorder = IsaacSimRecorder(current_task=None, dataset=None)
 
     # 设置信号处理
     def signal_handler(sig, frame):
         print("\n接收到中断信号，正在退出...")
-        recorder.stop_recording()
+        ds = recorder.stop_recording()
+        if ds is not None:
+            print("完成数据集...")
+            ds.finalize()
+            print(f"数据集已保存到: {recorder.current_dataset_root}")
         recorder.destroy_node()
         rclpy.shutdown()
-
-        # 完成数据集
-        print("完成数据集...")
-        dataset.finalize()
-        print(f"数据集已保存到: {DATASET_ROOT}")
         sys.exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)
 
     # 简单的键盘控制
     print("\n控制命令:")
-    print("  s - 开始录制")
-    print("  q - 停止录制并保存 episode")
-    print("  x - 退出程序")
+    print("  s-<name> - 创建新数据集并开始录制 (如 s-step10, s-step12)")
+    print("            数据集保存路径: isaacsim/<name>/robot_recording_YYYYmmdd_HHMMSS")
+    print("  q        - 停止录制并保存当前数据集")
+    print("  x        - 退出程序")
+    print("=" * 60)
+    print("提示: 也可通过 /lerobot_command topic 发送命令 (s-<name>/record_discard/record_exit)")
     print("=" * 60)
 
-    # 在单独的线程中运行 ROS2  spin
+    # 在单独的线程中运行 ROS2 spin
     spin_thread = threading.Thread(target=rclpy.spin, args=(recorder,))
     spin_thread.start()
 
     try:
         while True:
-            cmd = input().strip().lower()
+            # 检查 /lerobot_command 是否请求退出
+            if recorder.should_exit:
+                print("收到 /lerobot_command record_exit 命令，正在退出...")
+                break
 
-            if cmd == 's':
+            # 使用 select 实现非阻塞 stdin 检查（1秒超时），
+            # 确保 should_exit 标志能被及时检测到
+            ready, _, _ = select.select([sys.stdin], [], [], 1.0)
+            if ready:
+                cmd = sys.stdin.readline().strip().lower()
+            else:
+                continue  # 超时，重新检查 should_exit
+
+            if cmd.startswith("s-"):
+                sub_dir = cmd[2:]  # "s-step10" → "step10"
+                # 如果正在录制，先停止并完成上一个数据集
+                if recorder.recording:
+                    old_dataset = recorder.stop_recording()
+                    if old_dataset is not None:
+                        print("完成上一个数据集...")
+                        old_dataset.finalize()
+                        print(f"上一个数据集已保存到: {recorder.current_dataset_root}")
+
+                # 创建新数据集并开始录制
+                recorder.current_dataset, recorder.current_dataset_root = _create_new_dataset(sub_dir)
+                recorder.set_dataset(recorder.current_dataset)
                 recorder.start_recording()
+
             elif cmd == 'q':
-                recorder.stop_recording()
+                ds = recorder.stop_recording()
+                if ds is not None:
+                    print("完成数据集...")
+                    ds.finalize()
+                    print(f"数据集已保存到: {recorder.current_dataset_root}")
+                    recorder.current_dataset = None
+                    recorder.current_dataset_root = None
+                else:
+                    print("未在录制中")
+
             elif cmd == 'x':
                 break
             else:
-                print("未知命令，使用: s(开始), q(停止), x(退出)")
+                print("未知命令，使用: s-<name>(创建数据集并录制), q(停止), x(退出)")
 
     except KeyboardInterrupt:
         pass
     finally:
         # 清理
-        recorder.stop_recording()
+        ds = recorder.stop_recording()
+        if ds is not None:
+            print("完成数据集...")
+            ds.finalize()
+            print(f"数据集已保存到: {recorder.current_dataset_root}")
         recorder.destroy_node()
         rclpy.shutdown()
         spin_thread.join()
 
-        # 完成数据集
         print("=" * 60)
-        print("完成数据集...")
-        dataset.finalize()
-        print(f"数据集已保存到: {DATASET_ROOT}")
-        print(f"总 episodes: {dataset.meta.total_episodes}")
-        print(f"总 frames: {dataset.meta.total_frames}")
+        print("录制器已退出")
         print("=" * 60)
 
 
